@@ -1,4 +1,4 @@
-import { Document, Paragraph, Table } from 'docx';
+import { Document, Paragraph } from 'docx';
 import {
     buildFooter,
     buildHeader,
@@ -7,92 +7,67 @@ import {
     noveltyDetail,
     noveltyTitle,
     thinSeparator,
-    imageGallery,
-} from './blocks'; // ← viene del barrel de la CARPETA
+} from './blocks';
+import { imageGallery } from './blocks/imageGallery';
 import type { SeccionArea, BuildDocInput } from './types';
 
-/** Carga una imagen, valida que sea imagen, obtiene tamaño real
- *  y devuelve bytes + tamaño escalado manteniendo proporción dentro de (maxW x maxH). */
-async function loadImageWithSize(
-    url: string,
-    maxW = 250,
-    maxH = 160
-): Promise<{ data: Uint8Array; width: number; height: number } | null> {
-    const res = await fetch(url);
-    if (!res.ok) return null;
+import {
+    loadImageOriginal,
+    insertarOrdenado,
+} from './images';
 
-    const blob = await res.blob();
 
-    if (!blob.type || !blob.type.startsWith('image/')) return null;
-
-    const objectUrl = URL.createObjectURL(blob);
-    const dims = await new Promise<{ w: number; h: number }>(
-        (resolve, reject) => {
-            const img = new Image();
-            img.onload = () => {
-                const w = img.naturalWidth || 0;
-                const h = img.naturalHeight || 0;
-                URL.revokeObjectURL(objectUrl);
-                resolve({ w, h });
-            };
-            img.onerror = (e) => {
-                URL.revokeObjectURL(objectUrl);
-                reject(e);
-            };
-            img.src = objectUrl;
-        }
-    ).catch(() => ({ w: 0, h: 0 }));
-
-    if (!dims.w || !dims.h) return null;
-
-    const scale = Math.min(maxW / dims.w, maxH / dims.h, 1);
-    const width = Math.max(1, Math.round(dims.w * scale));
-    const height = Math.max(1, Math.round(dims.h * scale));
-
-    const buf = await blob.arrayBuffer();
-    const data = new Uint8Array(buf);
-    if (data.byteLength === 0) return null;
-
-    return { data, width, height };
-}
-
-/** Construye TODAS las secciones (sin límite de items) */
 async function buildSectionsAsync(
-    sections: SeccionArea[]
-): Promise<(Paragraph | Table)[]> {
-    const out: (Paragraph | Table)[] = [];
+    sections: SeccionArea[],
+    pageContentWidthPx: number, // ancho de contenido efectivo (px lógicos docx)
+    minImageWidthPx = 0         // opcional: mínimo para evitar thumbnails
+): Promise<Paragraph[]> {
+    const out: Paragraph[] = [];
 
     for (const { areaNovedad, items } of sections) {
-        // Encabezado del área
         out.push(areaHeading(areaNovedad));
 
-        for (const {
-            tituloNovedad,
-            detalleNovedad,
-            imagenesNovedad,
-        } of items) {
+        for (const { tituloNovedad, detalleNovedad, imagenesNovedad } of items) {
             out.push(noveltyTitle(tituloNovedad));
             out.push(noveltyDetail(detalleNovedad));
 
-            // Galería de imágenes (si hay): ahora SIEMPRE 1 columna y centradas (lo maneja imageGallery)
             if (imagenesNovedad && imagenesNovedad.length > 0) {
-                const images: {
-                    data: Uint8Array;
-                    width: number;
-                    height: number;
-                }[] = [];
+                type ImgScaled = { data: Uint8Array; width: number; height: number };
+                const escaladas: ImgScaled[] = [];
+
                 for (const url of imagenesNovedad) {
                     try {
-                        const img = await loadImageWithSize(url, 250, 160);
-                        if (img) images.push(img);
+                        const raw = await loadImageOriginal(url);
+                        if (!raw) continue;
+
+                        const relacion = raw.alto / raw.ancho;
+                        const anchoMax = Math.max(1, pageContentWidthPx);
+                        const anchoNaturalClamped = Math.min(anchoMax, raw.ancho);
+                        const altoNaturalClamped = Math.round(anchoNaturalClamped * relacion);
+
+
+                        const width = Math.max(anchoNaturalClamped, minImageWidthPx || 0);
+                        const height = Math.round(width * relacion);
+
+
+                        insertarOrdenado(
+                            escaladas,
+                            { data: raw.data, width, height },
+                            (a, b) => {
+                                const diffAlto = a.height - b.height;
+                                return diffAlto !== 0 ? diffAlto : (a.width - b.width);
+                            }
+                        );
                     } catch {
-                        /* omit */
+
                     }
                 }
-                if (images.length > 0) out.push(imageGallery(images));
+
+                if (escaladas.length > 0) {
+                    out.push(...imageGallery(escaladas));
+                }
             }
 
-            // Separador al final de cada item
             out.push(thinSeparator());
         }
 
@@ -103,7 +78,7 @@ async function buildSectionsAsync(
     return out;
 }
 
-/** Builder principal (async) */
+/* Builder principal (async) */
 export async function createNovedadesDoc(
     input: BuildDocInput
 ): Promise<Document> {
@@ -113,9 +88,13 @@ export async function createNovedadesDoc(
         confidentialityLabel = 'YPF-Confidencial',
     } = input;
 
+
+    const PAGE_CONTENT_WIDTH = 500;
+    const MIN_IMAGE_WIDTH = 0;
+
     const sectionChildren = [
         makeareaBox(sectorGeneral),
-        ...(await buildSectionsAsync(novedad)),
+        ...(await buildSectionsAsync(novedad, PAGE_CONTENT_WIDTH, MIN_IMAGE_WIDTH)),
     ];
 
     return new Document({
@@ -123,8 +102,9 @@ export async function createNovedadesDoc(
             default: {
                 document: {
                     run: { font: 'Calibri' },
-                    paragraph: { spacing: { line: 276 } }, // ~1.15
+                    paragraph: { spacing: { line: 276 } },
                 },
+
             },
         },
         sections: [
